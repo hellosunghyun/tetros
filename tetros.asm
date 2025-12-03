@@ -1,324 +1,570 @@
-; Tetris
-	org 7c00h
+; ============================================================================
+; 테트로스 (TetrOS) - 부트섹터 테트리스 게임
+; ============================================================================
+; 이 프로그램은 512바이트 부트섹터에서 직접 실행되는 테트리스 게임입니다.
+; 운영체제 없이 BIOS 인터럽트만을 사용하여 동작합니다.
+;
+; 메모리 주소 0x7C00에 로드되어 실행됩니다 (MBR 표준 위치).
+; ============================================================================
+
+	org 7c00h                    ; 부트섹터는 메모리 주소 0x7C00에 로드됨
 
 ; ==============================================================================
-; DEBUGGING MACROS
+; 디버깅 매크로 섹션
 ; ==============================================================================
+; DEBUG 플래그가 정의된 경우에만 디버그 매크로를 포함합니다.
+; 이를 통해 개발 중 디버깅과 릴리스 빌드를 구분할 수 있습니다.
 
 %ifdef DEBUG
-%include "debug_macros.asm"
+%include "debug_macros.asm"      ; 디버그용 매크로 파일 포함
 %endif
 
 ; ==============================================================================
-; MACROS
+; 매크로 정의 섹션
 ; ==============================================================================
+; 반복적으로 사용되는 코드를 매크로로 정의하여 코드 크기를 줄입니다.
+; 부트섹터는 512바이트 제한이 있으므로 코드 최적화가 매우 중요합니다.
 
-; Sleeps for the given number of microseconds.
+; ------------------------------------------------------------------------------
+; sleep 매크로: 지정된 마이크로초 동안 대기
+; ------------------------------------------------------------------------------
+; 입력: %1 = 대기할 마이크로초 (16비트 값)
+; 사용 레지스터: AH, CX, DX
+; BIOS 인터럽트: INT 15h, AH=86h (대기 함수)
+; ------------------------------------------------------------------------------
 %macro sleep 1
-	pusha
-	xor cx, cx
-	mov dx, %1
-	mov ah, 0x86
-	int 0x15
-	popa
+	pusha                        ; 모든 범용 레지스터를 스택에 저장 (8개 레지스터)
+	xor cx, cx                   ; CX = 0 (대기 시간의 상위 16비트, 여기서는 0)
+	mov dx, %1                   ; DX = 대기할 마이크로초 (하위 16비트)
+	mov ah, 0x86                 ; BIOS 대기 함수 선택
+	int 0x15                     ; BIOS 인터럽트 호출 - CX:DX 마이크로초 대기
+	popa                         ; 모든 범용 레지스터를 스택에서 복원
 %endmacro
 
-; Choose a brick at random.
+; ------------------------------------------------------------------------------
+; select_brick 매크로: 무작위로 테트리스 블록(테트로미노) 선택
+; ------------------------------------------------------------------------------
+; 출력: AL = 선택된 블록의 오프셋 (0, 8, 16, 24, 32, 40, 48 중 하나)
+; 알고리즘: 선형 합동 생성기(LCG) 기반 의사 난수 생성
+;           - 현재 시간(틱)을 시드와 XOR
+;           - 31을 곱하고 1을 더함
+;           - 7로 나눈 나머지를 사용 (0-6 범위)
+;           - 결과에 8을 곱함 (각 블록 데이터가 8바이트)
+; ------------------------------------------------------------------------------
 %macro select_brick 0
-	mov ah, 2                    ; get current time
-	int 0x1a
-	mov al, byte [seed_value]
-	xor ax, dx
-	mov bl, 31
-	mul bx
-	inc ax
-	mov byte [seed_value], al
-	xor dx, dx
-	mov bx, 7
-	div bx
-	shl dl, 3
-	xchg ax, dx                  ; mov al, dl
+	mov ah, 2                    ; BIOS 시간 함수: 현재 틱 카운터 읽기
+	int 0x1a                     ; INT 1Ah - DX에 현재 틱 카운터 반환
+	mov al, byte [seed_value]    ; 이전 시드 값을 AL에 로드
+	xor ax, dx                   ; 시간 값과 XOR하여 엔트로피 추가
+	mov bl, 31                   ; 승수 31 (소수 사용으로 분포 개선)
+	mul bx                       ; AX = AX * 31 (16비트 곱셈)
+	inc ax                       ; AX++ (LCG 공식: next = (seed * 31 + 1))
+	mov byte [seed_value], al    ; 새 시드 값 저장 (다음 호출용)
+	xor dx, dx                   ; DX = 0 (나눗셈을 위한 상위 워드 초기화)
+	mov bx, 7                    ; 나눗셈 제수 = 7 (7가지 테트로미노)
+	div bx                       ; AX / 7, 나머지는 DX에 저장 (0-6)
+	shl dl, 3                    ; DL *= 8 (각 블록이 8바이트이므로)
+	xchg ax, dx                  ; AL = DL (결과를 AL로 이동, 바이트 절약)
 %endmacro
 
-; Sets video mode and hides cursor.
+; ------------------------------------------------------------------------------
+; clear_screen 매크로: 화면을 지우고 커서를 숨김
+; ------------------------------------------------------------------------------
+; 비디오 모드를 설정하여 화면을 초기화하고 커서를 보이지 않게 합니다.
+; 모드 00h: 40x25 텍스트 모드 (컬러)
+; ------------------------------------------------------------------------------
 %macro clear_screen 0
-	xor ax, ax                   ; clear screen (40x25)
-	int 0x10
-	mov ah, 1                    ; hide cursor
-	mov cx, 0x2607
-	int 0x10
+	xor ax, ax                   ; AX = 0, 비디오 모드 00h 설정 (40x25 텍스트)
+	int 0x10                     ; BIOS 비디오 인터럽트 - 화면 초기화
+	mov ah, 1                    ; 커서 모양 설정 함수
+	mov cx, 0x2607               ; CH=26h (시작 스캔라인), CL=07h (끝 스캔라인)
+	                             ; 시작 > 끝이면 커서가 보이지 않음
+	int 0x10                     ; 커서 숨기기 적용
 %endmacro
 
-field_left_col:  equ 13
-field_width:     equ 14
-inner_width:     equ 12
-inner_first_col: equ 14
-start_row_col:   equ 0x0412
+; ------------------------------------------------------------------------------
+; 게임 필드 상수 정의
+; ------------------------------------------------------------------------------
+; 테트리스 게임 필드의 위치와 크기를 정의합니다.
+; 40x25 텍스트 모드에서의 좌표 시스템 사용
+; ------------------------------------------------------------------------------
+field_left_col:  equ 13          ; 게임 필드 왼쪽 테두리 열 (13번째 열)
+field_width:     equ 14          ; 게임 필드 전체 너비 (테두리 포함, 14칸)
+inner_width:     equ 12          ; 게임 필드 내부 너비 (블록이 놓이는 공간, 12칸)
+inner_first_col: equ 14          ; 게임 필드 내부 시작 열 (14번째 열)
+start_row_col:   equ 0x0412      ; 새 블록 시작 위치 (행=4, 열=18, DH:DL 형식)
 
+; ------------------------------------------------------------------------------
+; init_screen 매크로: 테트리스 게임 필드 초기화
+; ------------------------------------------------------------------------------
+; 화면을 지우고 테트리스 게임 필드(테두리 포함)를 그립니다.
+; 회색 배경으로 테두리를 그리고 내부는 검은색으로 채웁니다.
+; ------------------------------------------------------------------------------
 %macro init_screen 0
-	clear_screen
-	mov dh, 3                        ; row
-	mov cx, 18                       ; number of rows
-ia: push cx
-	inc dh                           ; increment row
-	mov dl, field_left_col           ; set column
-	mov cx, field_width              ; width of box
-	mov bx, 0x78                     ; color
-	call set_and_write
-	cmp dh, 21                       ; don't remove last line
-	je ib                            ; if last line jump
-	inc dx                           ; increase column
-	mov cx, inner_width              ; width of box
-	xor bx, bx                       ; color
-	call set_and_write
-ib: pop cx
-	loop ia
+	clear_screen                     ; 먼저 화면을 지우고 커서 숨김
+	mov dh, 3                        ; 시작 행 = 3 (곧 4로 증가됨)
+	mov cx, 18                       ; 총 18개 행을 그림 (행 4-21)
+ia:                                  ; 'ia' = init area, 영역 초기화 루프
+	push cx                          ; 루프 카운터 저장
+	inc dh                           ; 행 번호 증가 (4, 5, 6, ... 21)
+	mov dl, field_left_col           ; 열을 필드 왼쪽 테두리로 설정 (13)
+	mov cx, field_width              ; 너비 = 14칸 (전체 행)
+	mov bx, 0x78                     ; 색상: 0x78 = 회색 배경 + 회색 전경
+	                                 ; (상위 4비트=배경, 하위 4비트=전경)
+	call set_and_write               ; 커서 설정 후 공백 문자 출력
+	cmp dh, 21                       ; 마지막 행(21)인지 확인
+	je ib                            ; 마지막 행이면 내부 지우기 건너뜀
+	                                 ; (바닥 테두리는 그대로 유지)
+	inc dx                           ; 열 증가 (내부 영역 시작점으로)
+	mov cx, inner_width              ; 내부 너비 = 12칸
+	xor bx, bx                       ; 색상 = 0 (검은색 배경, 검은색 전경)
+	call set_and_write               ; 내부를 검은색으로 채움
+ib:                                  ; 'ib' = init bottom, 하단 처리
+	pop cx                           ; 루프 카운터 복원
+	loop ia                          ; 18번 반복 (CX-- 후 CX≠0이면 점프)
 %endmacro
 
 ; ==============================================================================
+; 메모리 변수 주소 정의
+; ==============================================================================
+; 부트섹터 코드 외부의 메모리 영역을 변수 저장소로 사용합니다.
+; 0x7F00 영역은 안전하게 사용할 수 있는 메모리입니다.
+; ------------------------------------------------------------------------------
+delay:      equ 0x7f00               ; 블록 낙하 지연 시간 (바이트)
+seed_value: equ 0x7f02               ; 난수 생성기 시드 값 (바이트)
 
-delay:      equ 0x7f00
-seed_value: equ 0x7f02
-
+; ==============================================================================
+; 코드 섹션 시작
+; ==============================================================================
 section .text
 
+; ==============================================================================
+; 메인 게임 진입점: start_tetris
+; ==============================================================================
+; 게임 초기화 및 메인 게임 루프를 시작합니다.
+; 부트섹터가 로드되면 이 지점부터 실행이 시작됩니다.
+; ==============================================================================
 start_tetris:
-	xor ax, ax
-	mov ds, ax
-	init_screen
+	xor ax, ax                       ; AX = 0
+	mov ds, ax                       ; 데이터 세그먼트를 0으로 설정
+	                                 ; (메모리 주소가 0x0000:XXXX 형식이 됨)
+	init_screen                      ; 게임 화면 초기화 (필드 그리기)
+
+; ------------------------------------------------------------------------------
+; new_brick: 새로운 블록 생성
+; ------------------------------------------------------------------------------
+; 새 테트로미노를 선택하고 시작 위치에 배치합니다.
+; ------------------------------------------------------------------------------
 new_brick:
-	mov byte [delay], 100            ; 3 * 100 = 300ms
-	select_brick                     ; returns the selected brick in AL
-	mov dx, start_row_col            ; start at row 4 and col 38
-lp:
-	call check_collision
-	jne $                            ; collision -> game over
-	call print_brick
+	mov byte [delay], 100            ; 낙하 지연 = 100 (3ms × 100 = 300ms)
+	select_brick                     ; 무작위 블록 선택, 결과는 AL에 저장
+	mov dx, start_row_col            ; 시작 위치 설정 (행=4, 열=18)
 
+; ------------------------------------------------------------------------------
+; lp: 메인 게임 루프
+; ------------------------------------------------------------------------------
+; 블록의 이동, 충돌 검사, 화면 갱신을 처리합니다.
+; ------------------------------------------------------------------------------
+lp:                                  ; 'lp' = loop, 메인 루프
+	call check_collision             ; 현재 위치에서 충돌 검사
+	jne $                            ; 충돌 발생 시 무한 루프 (게임 오버)
+	                                 ; '$'는 현재 주소를 의미
+	call print_brick                 ; 블록을 화면에 그림
+
+; ------------------------------------------------------------------------------
+; wait_or_keyboard: 키 입력 대기 및 처리 루프
+; ------------------------------------------------------------------------------
+; 일정 시간 대기하면서 키보드 입력을 감지합니다.
+; 키 입력에 따라 블록을 이동하거나 회전시킵니다.
+; ------------------------------------------------------------------------------
 wait_or_keyboard:
-	xor cx, cx
-	mov cl, byte [delay]
-wait_a:
-	push cx
-	sleep 3000                       ; wait 3ms
+	xor cx, cx                       ; CX 상위 바이트 = 0
+	mov cl, byte [delay]             ; CL = 현재 지연 값 (대기 반복 횟수)
 
-	push ax
-	mov ah, 1                    ; check for keystroke; AX modified
-	int 0x16                     ; http://www.ctyme.com/intr/rb-1755.htm
-	mov cx, ax
-	pop ax
-	jz no_key                    ; no keystroke
-	call clear_brick
-                                 ; 4b left, 48 up, 4d right, 50 down
-	cmp ch, 0x4b                 ; left arrow
-	je left_arrow                ; http://stackoverflow.com/questions/16939449/how-to-detect-arrow-keys-in-assembly
-	cmp ch, 0x48                 ; up arrow
-	je up_arrow
-	cmp ch, 0x4d
-	je right_arrow
+wait_a:                              ; 'wait_a' = 대기 루프 A
+	push cx                          ; 루프 카운터 저장
+	sleep 3000                       ; 3000 마이크로초 = 3밀리초 대기
 
-	mov byte [delay], 10         ; every other key is fast down
-	jmp clear_keys
+	push ax                          ; 현재 블록 정보(AL) 보존
+	mov ah, 1                        ; 키보드 버퍼 확인 함수
+	int 0x16                         ; BIOS 키보드 인터럽트
+	                                 ; ZF=1이면 키 없음, ZF=0이면 키 있음
+	mov cx, ax                       ; 키 정보를 CX에 임시 저장
+	pop ax                           ; 블록 정보 복원
+	jz no_key                        ; 키 입력 없으면 no_key로 점프
+
+	; --- 키 입력이 있는 경우 처리 ---
+	call clear_brick                 ; 현재 위치의 블록을 지움 (이동 준비)
+
+	; 스캔코드 확인 (CH에 스캔코드가 있음)
+	; 0x4B = 왼쪽 화살표, 0x48 = 위쪽 화살표
+	; 0x4D = 오른쪽 화살표, 0x50 = 아래쪽 화살표
+	cmp ch, 0x4b                     ; 왼쪽 화살표인가?
+	je left_arrow                    ; 맞으면 왼쪽 이동 처리
+	cmp ch, 0x48                     ; 위쪽 화살표인가?
+	je up_arrow                      ; 맞으면 회전 처리
+	cmp ch, 0x4d                     ; 오른쪽 화살표인가?
+	je right_arrow                   ; 맞으면 오른쪽 이동 처리
+
+	; 기타 키 = 빠른 낙하 (보통 스페이스바나 아래 화살표)
+	mov byte [delay], 10             ; 지연 시간을 10으로 줄임 (빠른 낙하)
+	jmp clear_keys                   ; 키 버퍼 정리로 이동
+
+; --- 왼쪽 화살표 처리 ---
 left_arrow:
-	dec dx
-	call check_collision
-	je clear_keys                 ; no collision
-	inc dx
-	jmp clear_keys
+	dec dx                           ; 열 감소 (왼쪽으로 이동 시도)
+	call check_collision             ; 충돌 검사
+	je clear_keys                    ; 충돌 없으면 이동 성공
+	inc dx                           ; 충돌 있으면 원위치 복원
+	jmp clear_keys                   ; 키 버퍼 정리로 이동
+
+; --- 오른쪽 화살표 처리 ---
 right_arrow:
-	inc dx
-	call check_collision
-	je clear_keys                ; no collision
-	dec dx
-	jmp clear_keys
+	inc dx                           ; 열 증가 (오른쪽으로 이동 시도)
+	call check_collision             ; 충돌 검사
+	je clear_keys                    ; 충돌 없으면 이동 성공
+	dec dx                           ; 충돌 있으면 원위치 복원
+	jmp clear_keys                   ; 키 버퍼 정리로 이동
+
+; --- 위쪽 화살표 처리 (블록 회전) ---
 up_arrow:
-	mov bl, al
-	inc ax
-	inc ax
-	test al, 00000111b           ; check for overflow
-	jnz nf                       ; no overflow
-	sub al, 8
-nf: call check_collision
-	je clear_keys                ; no collision
-	mov al, bl
+	mov bl, al                       ; 현재 블록 오프셋 백업
+	inc ax                           ; 다음 회전 상태로 (오프셋 + 1)
+	inc ax                           ; 한 번 더 증가 (오프셋 + 2)
+	                                 ; 각 블록은 2바이트이므로 2씩 증가
+	test al, 00000111b               ; 하위 3비트 검사 (8로 나눈 나머지)
+	jnz nf                           ; 오버플로우 아니면 건너뜀
+	sub al, 8                        ; 오버플로우 시 8을 빼서 롤오버
+	                                 ; (같은 블록 종류 내에서 순환)
+nf:                                  ; 'nf' = no overflow
+	call check_collision             ; 회전 후 충돌 검사
+	je clear_keys                    ; 충돌 없으면 회전 성공
+	mov al, bl                       ; 충돌 있으면 원래 회전 상태로 복원
+
+; --- 키 버퍼 정리 및 블록 다시 그리기 ---
 clear_keys:
-	call print_brick
-	push ax
-	xor ah, ah                   ; remove key from buffer
-	int 0x16
-	pop ax
+	call print_brick                 ; 새 위치/상태로 블록 그리기
+	push ax                          ; 블록 정보 보존
+	xor ah, ah                       ; AH = 0: 키보드 버퍼에서 키 제거
+	int 0x16                         ; BIOS 키보드 인터럽트 (키 읽기)
+	pop ax                           ; 블록 정보 복원
+
+; --- 키 입력 없음 또는 키 처리 완료 ---
 no_key:
-	pop cx
-	loop wait_a
+	pop cx                           ; 루프 카운터 복원
+	loop wait_a                      ; CX-- 후 CX≠0이면 대기 계속
 
-	call clear_brick
-	inc dh                       ; increase row
-	call check_collision
-	je lp                        ; no collision
-	dec dh
-	call print_brick
-	call check_filled
-	jmp new_brick
+	; --- 대기 시간 종료, 블록 한 칸 아래로 이동 ---
+	call clear_brick                 ; 현재 위치의 블록 지움
+	inc dh                           ; 행 증가 (아래로 이동)
+	call check_collision             ; 충돌 검사
+	je lp                            ; 충돌 없으면 메인 루프 계속
+
+	; --- 바닥 또는 다른 블록에 닿음 ---
+	dec dh                           ; 원위치로 복원
+	call print_brick                 ; 블록을 현재 위치에 고정
+	call check_filled                ; 완성된 줄 확인 및 제거
+	jmp new_brick                    ; 새 블록 생성
+
+; ==============================================================================
+; 유틸리티 함수들
+; ==============================================================================
 
 ; ------------------------------------------------------------------------------
-
+; set_and_write: 커서 위치 설정 후 공백 문자 출력
+; ------------------------------------------------------------------------------
+; 입력: DH = 행, DL = 열, BL = 색상 속성, CX = 반복 횟수
+; 기능: 지정된 위치에 공백 문자를 지정된 색상으로 출력
+; ------------------------------------------------------------------------------
 set_and_write:
-	mov ah, 2                    ; set cursor
-	int 0x10
-	mov ax, 0x0920               ; write boxes
-	int 0x10
-	ret
-
-set_and_read:
-	mov ah, 2                    ; set cursor position
-	int 0x10
-	mov ah, 8                    ; read character and attribute, BH = 0
-	int 0x10                     ; result in AX
-	ret
+	mov ah, 2                        ; BIOS 함수: 커서 위치 설정
+	int 0x10                         ; DH=행, DL=열 위치로 커서 이동
+	mov ax, 0x0920                   ; AH=09h (문자 출력), AL=20h (공백 문자)
+	int 0x10                         ; BL 색상으로 CX개의 공백 출력
+	ret                              ; 호출자로 복귀
 
 ; ------------------------------------------------------------------------------
+; set_and_read: 커서 위치 설정 후 해당 위치의 문자 읽기
+; ------------------------------------------------------------------------------
+; 입력: DH = 행, DL = 열, BH = 페이지 번호 (보통 0)
+; 출력: AH = 색상 속성, AL = 문자 코드
+; 기능: 지정된 위치의 문자와 속성을 읽어옴
+; ------------------------------------------------------------------------------
+set_and_read:
+	mov ah, 2                        ; BIOS 함수: 커서 위치 설정
+	int 0x10                         ; DH=행, DL=열 위치로 커서 이동
+	mov ah, 8                        ; BIOS 함수: 문자 및 속성 읽기
+	int 0x10                         ; 결과: AH=속성, AL=문자
+	ret                              ; 호출자로 복귀
 
-; DH = current row
+; ==============================================================================
+; 줄 삭제 관련 매크로 및 함수
+; ==============================================================================
+
+; ------------------------------------------------------------------------------
+; replace_current_row 매크로: 현재 행을 위 행의 내용으로 교체
+; ------------------------------------------------------------------------------
+; 입력: DH = 현재 행 번호
+; 기능: 줄이 완성되어 삭제될 때 위의 모든 줄을 한 칸씩 아래로 이동
+;       현재 행의 각 칸을 바로 위 행의 해당 칸 내용으로 덮어씀
+; ------------------------------------------------------------------------------
 %macro replace_current_row 0
-	pusha                           ; replace current row with row above
- 	mov dl, inner_first_col
- 	mov cx, inner_width
-cf_aa:
-	push cx
-	dec dh                          ; decrement row
-	call set_and_read
-	inc dh                          ; increment row
-	mov bl, ah                      ; color from AH to BL
-	mov cl, 1
-	call set_and_write
-	inc dx                          ; next column
-	pop cx
-	loop cf_aa
-	popa
+	pusha                            ; 모든 레지스터 저장
+	mov dl, inner_first_col          ; 내부 영역 시작 열 (14)
+	mov cx, inner_width              ; 내부 너비 (12칸)
+cf_aa:                               ; 'cf_aa' = check filled, loop A
+	push cx                          ; 루프 카운터 저장
+	dec dh                           ; 위쪽 행으로 이동
+	call set_and_read                ; 위쪽 칸의 문자와 색상 읽기
+	inc dh                           ; 다시 현재 행으로
+	mov bl, ah                       ; 읽은 색상 속성을 BL로 이동
+	mov cl, 1                        ; 1개 문자 출력
+	call set_and_write               ; 현재 칸에 위쪽 칸의 내용 쓰기
+	inc dx                           ; 다음 열로 이동
+	pop cx                           ; 루프 카운터 복원
+	loop cf_aa                       ; 12칸 모두 처리할 때까지 반복
+	popa                             ; 모든 레지스터 복원
 %endmacro
 
+; ------------------------------------------------------------------------------
+; check_filled: 완성된 줄 확인 및 제거
+; ------------------------------------------------------------------------------
+; 기능: 게임 필드 전체를 스캔하여 완성된 줄(모든 칸이 채워진 줄)을 찾고
+;       발견되면 해당 줄을 삭제하고 위의 줄들을 아래로 이동
+; 재귀적으로 호출하여 여러 줄이 동시에 완성된 경우도 처리
+; ------------------------------------------------------------------------------
 check_filled:
-	pusha
-	mov dh, 21                       ; start at row 21
-next_row:
-	dec dh                           ; decrement row
-	jz cf_done                       ; at row 0 we are done
-	xor bx, bx
-	mov cx, inner_width
-	mov dl, inner_first_col          ; start at first inner column
-cf_loop:
-	call set_and_read
-	shr ah, 4                        ; rotate to get background color in AH
-	jz cf_is_zero                    ; jmp if background color is 0
-	inc bx                           ; increment counter
-	inc dx                           ; go to next column
+	pusha                            ; 모든 레지스터 저장
+	mov dh, 21                       ; 맨 아래 행(21)부터 시작
+
+next_row:                            ; 다음 행 검사
+	dec dh                           ; 위쪽 행으로 이동
+	jz cf_done                       ; 행 0에 도달하면 완료
+	xor bx, bx                       ; BX = 0 (채워진 칸 카운터)
+	mov cx, inner_width              ; 검사할 칸 수 (12개)
+	mov dl, inner_first_col          ; 시작 열 (14)
+
+cf_loop:                             ; 한 행의 각 칸 검사 루프
+	call set_and_read                ; 현재 칸의 문자와 속성 읽기
+	shr ah, 4                        ; 상위 4비트 = 배경색
+	jz cf_is_zero                    ; 배경색이 0(검정)이면 빈 칸
+	inc bx                           ; 채워진 칸이면 카운터 증가
+	inc dx                           ; 다음 열로 이동
 cf_is_zero:
-	loop cf_loop
-	cmp bl, inner_width              ; if counter is 12 full we found a full row
-	jne next_row
-replace_next_row:                    ; replace current row with rows above
-	replace_current_row
-	dec dh                           ; replace row above ... and so on
-	jnz replace_next_row
-	call check_filled                ; check for other full rows
-cf_done:
-	popa
-	ret
+	loop cf_loop                     ; 12칸 모두 검사할 때까지 반복
 
+	cmp bl, inner_width              ; 채워진 칸이 12개인가?
+	jne next_row                     ; 아니면 다음 행 검사
+
+	; --- 완성된 줄 발견! 위의 모든 줄을 아래로 이동 ---
+replace_next_row:
+	replace_current_row              ; 현재 행을 위 행 내용으로 교체
+	dec dh                           ; 위쪽 행으로 이동
+	jnz replace_next_row             ; 맨 위까지 반복
+
+	call check_filled                ; 재귀 호출: 다른 완성된 줄 확인
+
+cf_done:                             ; 'cf_done' = check filled done
+	popa                             ; 모든 레지스터 복원
+	ret                              ; 호출자로 복귀
+
+; ==============================================================================
+; 블록 그리기 함수들
+; ==============================================================================
+
+; ------------------------------------------------------------------------------
+; clear_brick: 현재 블록을 화면에서 지움
+; ------------------------------------------------------------------------------
+; 입력: AL = 블록 오프셋, DH:DL = 위치
+; 기능: 블록을 검은색으로 덮어써서 지움
+; ------------------------------------------------------------------------------
 clear_brick:
-	xor bx, bx
-	jmp print_brick_no_color
-print_brick:  ; al = 0AAAARR0
-	mov bl, al                   ; select the right color
-	shr bl, 3
-	inc bx
-	shl bl, 4
-print_brick_no_color:
-	inc bx                       ; set least significant bit
-	mov di, bx
-	jmp check_collision_main
-	; BL = color of brick
-	; DX = position (DH = row), AL = brick offset
-	; return: flag
+	xor bx, bx                       ; BX = 0 (검은색)
+	jmp print_brick_no_color         ; 색상 설정 건너뛰고 출력
+
+; ------------------------------------------------------------------------------
+; print_brick: 현재 블록을 화면에 그림
+; ------------------------------------------------------------------------------
+; 입력: AL = 블록 오프셋 (형식: 0AAAARR0)
+;           AAAA = 블록 종류 (0-6), RR = 회전 상태 (0-3)
+;       DH = 행, DL = 열
+; 기능: 블록을 해당 색상으로 화면에 그림
+; ------------------------------------------------------------------------------
+print_brick:
+	mov bl, al                       ; 블록 오프셋을 BL로 복사
+	shr bl, 3                        ; 오른쪽으로 3비트 시프트 (블록 종류 추출)
+	inc bx                           ; 색상 인덱스 1 증가 (0 회피)
+	shl bl, 4                        ; 왼쪽으로 4비트 시프트 (배경색 위치로)
+
+print_brick_no_color:                ; 색상 없이 출력 (clear_brick에서 사용)
+	inc bx                           ; 최하위 비트 설정 (파란색 전경)
+	mov di, bx                       ; 색상을 DI에 저장
+	jmp check_collision_main         ; 충돌 검사/그리기 통합 함수로 이동
+
+; ------------------------------------------------------------------------------
+; check_collision: 현재 위치에서 충돌 검사
+; ------------------------------------------------------------------------------
+; 입력: AL = 블록 오프셋, DH:DL = 위치
+; 출력: ZF = 1 (충돌 없음), ZF = 0 (충돌 발생)
+; 기능: 블록의 각 셀이 놓일 위치에 이미 블록이 있는지 확인
+; ------------------------------------------------------------------------------
 check_collision:
-	mov di, 0
-check_collision_main:            ; DI = 1 -> check, 0 -> print
-	pusha
-	xor bx, bx                   ; load the brick into AX
-	mov bl, al
-	mov ax, word [bricks + bx]
+	mov di, 0                        ; DI = 0: 충돌 검사 모드 (그리기 안 함)
 
-	xor bx, bx                   ; BH = page number, BL = collision counter
-	mov cx, 4
-cc:
-	push cx
-	mov cl, 4
-zz:
-	test ah, 10000000b
-	jz is_zero
+; ------------------------------------------------------------------------------
+; check_collision_main: 충돌 검사 및 블록 그리기 통합 함수
+; ------------------------------------------------------------------------------
+; 입력: DI = 0이면 충돌 검사만, DI ≠ 0이면 그리기도 수행 (DI = 색상)
+;       AL = 블록 오프셋, DH:DL = 위치
+; 출력: ZF = 1 (충돌 없음), ZF = 0 (충돌 발생)
+; 기능: 블록의 4x4 영역을 순회하며 각 셀 처리
+; ------------------------------------------------------------------------------
+check_collision_main:
+	pusha                            ; 모든 레지스터 저장
 
-	push ax
-	or di, di
-	jz ee                        ; we just want to check for collisions
-	pusha                        ; print space with color stored in DI
-	mov bx, di                   ; at position in DX
-	xor al, al
-	mov cx, 1
-	call set_and_write
-	popa
-	jmp is_zero_a
-ee:
-	call set_and_read
-	shr ah, 4                    ; rotate to get background color in AH
-	jz is_zero_a                 ; jmp if background color is 0
-	inc bx
+	; --- 블록 비트맵 데이터 로드 ---
+	xor bx, bx                       ; BX = 0
+	mov bl, al                       ; BL = 블록 오프셋
+	mov ax, word [bricks + bx]       ; AX = 블록 비트맵 (2바이트)
+	                                 ; AH = 1-2행, AL = 3-4행
+
+	xor bx, bx                       ; BH = 0 (페이지), BL = 충돌 카운터
+	mov cx, 4                        ; 4행 처리
+
+cc:                                  ; 'cc' = collision check, 행 루프
+	push cx                          ; 행 카운터 저장
+	mov cl, 4                        ; 4열 처리
+
+zz:                                  ; 'zz' = 열 루프
+	test ah, 10000000b               ; 최상위 비트 확인 (현재 셀)
+	jz is_zero                       ; 비트가 0이면 빈 셀, 건너뜀
+
+	; --- 블록 셀이 있는 위치 처리 ---
+	push ax                          ; 블록 비트맵 저장
+	or di, di                        ; DI가 0인지 확인
+	jz ee                            ; DI=0이면 충돌 검사만 수행
+
+	; --- 그리기 모드 (DI ≠ 0) ---
+	pusha                            ; 모든 레지스터 저장
+	mov bx, di                       ; 색상을 BX로
+	xor al, al                       ; AL = 0 (공백 문자)
+	mov cx, 1                        ; 1개 문자 출력
+	call set_and_write               ; 해당 위치에 색상 블록 출력
+	popa                             ; 레지스터 복원
+	jmp is_zero_a                    ; 다음 셀로
+
+ee:                                  ; 'ee' = 충돌 검사 모드
+	; --- 충돌 검사 모드 (DI = 0) ---
+	call set_and_read                ; 해당 위치의 문자/속성 읽기
+	shr ah, 4                        ; 배경색 추출 (상위 4비트)
+	jz is_zero_a                     ; 배경이 검정(0)이면 빈 공간
+	inc bx                           ; 충돌 카운터 증가
+
 is_zero_a:
-	pop ax
+	pop ax                           ; 블록 비트맵 복원
 
-is_zero:
-	shl ax, 1                    ; move to next bit in brick mask
-	inc dx                       ; move to next column
-	loop zz
-	sub dl, 4                    ; reset column
-	inc dh                       ; move to next row
-	pop cx
-	loop cc
-	or bl, bl                    ; bl != 0 -> collision
-	popa
-	ret
+is_zero:                             ; 빈 셀이거나 처리 완료
+	shl ax, 1                        ; 비트맵을 왼쪽으로 시프트 (다음 셀)
+	inc dx                           ; 다음 열로 이동
+	loop zz                          ; 4열 처리할 때까지 반복
 
+	sub dl, 4                        ; 열을 처음으로 리셋
+	inc dh                           ; 다음 행으로 이동
+	pop cx                           ; 행 카운터 복원
+	loop cc                          ; 4행 처리할 때까지 반복
+
+	or bl, bl                        ; BL ≠ 0이면 충돌 발생 (ZF = 0)
+	popa                             ; 모든 레지스터 복원
+	ret                              ; 호출자로 복귀 (플래그는 유지됨)
+
+; ==============================================================================
+; 블록 데이터 테이블 (테트로미노 비트맵)
+; ==============================================================================
+; 각 테트로미노는 4가지 회전 상태를 가지며, 각 상태는 2바이트로 표현됩니다.
+;
+; 비트맵 구조 (2바이트 = 16비트):
+;   AH (상위 바이트): 1행과 2행 (각 4비트)
+;   AL (하위 바이트): 3행과 4행 (각 4비트)
+;
+; 7가지 테트로미노:
+;   I (막대), L, J, O (정사각형), S, T, Z
+; 각각 4개의 회전 상태 × 2바이트 = 블록당 8바이트
 ; ==============================================================================
 
 bricks:
-	;  in AL      in AH
-	;  3rd + 4th  1st + 2nd row
-	db 01000100b, 01000100b, 00000000b, 11110000b
-	db 01000100b, 01000100b, 00000000b, 11110000b
-	db 01100000b, 00100010b, 00000000b, 11100010b
-	db 01000000b, 01100100b, 00000000b, 10001110b
-	db 01100000b, 01000100b, 00000000b, 00101110b
-	db 00100000b, 01100010b, 00000000b, 11101000b
-	db 00000000b, 01100110b, 00000000b, 01100110b
-	db 00000000b, 01100110b, 00000000b, 01100110b
-	db 00000000b, 11000110b, 01000000b, 00100110b
-	db 00000000b, 11000110b, 01000000b, 00100110b
-	db 00000000b, 01001110b, 01000000b, 01001100b
-	db 00000000b, 11100100b, 10000000b, 10001100b
-	db 00000000b, 01101100b, 01000000b, 10001100b
-	db 00000000b, 01101100b, 01000000b, 10001100b
+	; === I 블록 (막대 모양) - 하늘색 ===
+	;  AL (3-4행)    AH (1-2행)
+	db 01000100b, 01000100b      ; 회전 0: 수직 막대
+	db 00000000b, 11110000b      ; 회전 1: 수평 막대
+	db 01000100b, 01000100b      ; 회전 2: 수직 막대 (0과 동일)
+	db 00000000b, 11110000b      ; 회전 3: 수평 막대 (1과 동일)
+
+	; === L 블록 - 주황색 ===
+	db 01100000b, 00100010b      ; 회전 0
+	db 00000000b, 11100010b      ; 회전 1
+	db 01000000b, 01100100b      ; 회전 2
+	db 00000000b, 10001110b      ; 회전 3
+
+	; === J 블록 - 파란색 ===
+	db 01100000b, 01000100b      ; 회전 0
+	db 00000000b, 00101110b      ; 회전 1
+	db 00100000b, 01100010b      ; 회전 2
+	db 00000000b, 11101000b      ; 회전 3
+
+	; === O 블록 (정사각형) - 노란색 ===
+	db 00000000b, 01100110b      ; 회전 0
+	db 00000000b, 01100110b      ; 회전 1 (동일)
+	db 00000000b, 01100110b      ; 회전 2 (동일)
+	db 00000000b, 01100110b      ; 회전 3 (동일)
+
+	; === S 블록 - 초록색 ===
+	db 00000000b, 11000110b      ; 회전 0
+	db 01000000b, 00100110b      ; 회전 1
+	db 00000000b, 11000110b      ; 회전 2 (0과 동일)
+	db 01000000b, 00100110b      ; 회전 3 (1과 동일)
+
+	; === T 블록 - 보라색 ===
+	db 00000000b, 01001110b      ; 회전 0
+	db 01000000b, 01001100b      ; 회전 1
+	db 00000000b, 11100100b      ; 회전 2
+	db 10000000b, 10001100b      ; 회전 3
+
+	; === Z 블록 - 빨간색 ===
+	db 00000000b, 01101100b      ; 회전 0
+	db 01000000b, 10001100b      ; 회전 1
+	db 00000000b, 01101100b      ; 회전 2 (0과 동일)
+	db 01000000b, 10001100b      ; 회전 3 (1과 동일)
+
+; ==============================================================================
+; 부트섹터 구조 (파티션 테이블 및 시그니처)
+; ==============================================================================
+; 부트섹터는 정확히 512바이트여야 하며, 마지막 2바이트는
+; 부트 시그니처(0x55, 0xAA)여야 합니다.
+;
+; 일부 BIOS/컴퓨터에서는 파티션 테이블이 필요하므로
+; 더미 파티션 테이블 엔트리를 포함합니다.
+; ==============================================================================
 
 %ifndef DEBUG
-; It seems that I need a dummy partition table entry for my notebook.
-times 446-($-$$) db 0
-	db 0x80                   ; bootable
-    db 0x00, 0x01, 0x00       ; start CHS address
-    db 0x17                   ; partition type
-    db 0x00, 0x02, 0x00       ; end CHS address
-    db 0x00, 0x00, 0x00, 0x00 ; LBA
-    db 0x02, 0x00, 0x00, 0x00 ; number of sectors
+; 디버그 모드가 아닐 때만 부트섹터 구조 포함
+; (디버그 빌드는 512바이트 제한을 초과할 수 있음)
 
-; At the end we need the boot sector signature.
-times 510-($-$$) db 0
-	db 0x55
-	db 0xaa
+; --- 파티션 테이블까지 0으로 채움 ---
+times 446-($-$$) db 0                ; 현재 위치부터 446바이트까지 0으로 채움
+
+; --- 더미 파티션 테이블 엔트리 (16바이트) ---
+	db 0x80                          ; 부팅 가능 플래그 (0x80 = 부팅 가능)
+	db 0x00, 0x01, 0x00              ; 시작 CHS 주소 (실린더/헤드/섹터)
+	db 0x17                          ; 파티션 타입 (0x17 = 숨김 NTFS)
+	db 0x00, 0x02, 0x00              ; 끝 CHS 주소
+	db 0x00, 0x00, 0x00, 0x00        ; LBA 시작 주소 (4바이트)
+	db 0x02, 0x00, 0x00, 0x00        ; 섹터 수 (4바이트)
+
+; --- 부트 시그니처까지 0으로 채움 ---
+times 510-($-$$) db 0                ; 510바이트까지 0으로 채움
+
+; --- 부트 시그니처 (필수!) ---
+	db 0x55                          ; 시그니처 바이트 1
+	db 0xaa                          ; 시그니처 바이트 2
+	                                 ; BIOS는 이 시그니처로 부팅 가능 여부 판단
 %endif
